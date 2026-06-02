@@ -11,16 +11,22 @@ Architecture :
     Redis (pub/sub listening_events + p2p_network_events)
         → consume_from_redis()
         → validate_events()          ← invalides → DLQ
-        → enrich_events()            ← jointure catalogue PostgreSQL
-        → store_to_parquet()         ← MinIO partitionné par heure
-        → upsert_to_postgres()       ← table listening_events
+        → route_events()             ← branche conditionnelle (listening / p2p / skip)
+        ├─ enrich_events()           ← jointure catalogue PostgreSQL
+        │   → store_to_parquet()     ← MinIO partitionné par heure
+        │   → upsert_to_postgres()   ← table listening_events
+        ├─ store_p2p_to_parquet()    ← MinIO p2p_network_events
+        └─ skip_processing           ← batch vide
+        → summarize()                ← jointure finale (trigger_rule)
 """
 
 from datetime import datetime, timedelta
 
 from airflow import DAG
 from airflow.decorators import task
+from airflow.operators.empty import EmptyOperator
 from airflow.providers.postgres.hooks.postgres import PostgresHook
+from airflow.utils.trigger_rule import TriggerRule
 
 DAG_DOC = """
 ## streaming_events_pipeline
@@ -36,7 +42,17 @@ les valide, les enrichit et les stocke en dual : Parquet (MinIO) + PostgreSQL.
 ### Destinations
 - Table `listening_events` (PostgreSQL)
 - Fichiers Parquet sur MinIO : `s3://spotify-parquet/listening_events/date=.../hour=.../`
+- Fichiers Parquet sur MinIO : `s3://spotify-parquet/p2p_network_events/date=.../hour=.../`
 - Table `dead_letter_events` (pour les events invalides)
+
+### Branches conditionnelles
+Après validation, `route_events` (BranchPythonOperator via @task.branch)
+choisit dynamiquement les chemins à exécuter selon le contenu du batch :
+- des listening events valides → `enrich_events` → store + upsert
+- des p2p events valides       → `store_p2p_to_parquet`
+- batch vide                   → `skip_processing` (EmptyOperator)
+La tâche finale `summarize` se déclenche avec NONE_FAILED_MIN_ONE_SUCCESS
+pour s'exécuter quel que soit le chemin emprunté.
 
 ### Idempotence
 Chaque event est identifié par `event_id` (UUID).
@@ -180,6 +196,35 @@ with DAG(
             "valid_p2p":       valid_p2p,
             "errors":          len(errors),
         }
+
+    @task.branch(task_id="route_events")
+    def route_events(validated: dict, **context) -> list:
+        """
+        Branche conditionnelle : choisit dynamiquement les chemins à exécuter
+        en fonction du contenu du batch validé.
+
+        - listening events présents → "enrich_events"
+        - p2p events présents       → "store_p2p_to_parquet"
+        - rien à traiter            → "skip_processing"
+
+        @task.branch s'appuie sur BranchPythonOperator : seules les tâches
+        dont l'id est retourné s'exécutent, les autres sont marquées skipped.
+        """
+        import logging
+
+        logger = logging.getLogger(__name__)
+
+        paths = []
+        if validated.get("valid_listening"):
+            paths.append("enrich_events")
+        if validated.get("valid_p2p"):
+            paths.append("store_p2p_to_parquet")
+
+        if not paths:
+            paths.append("skip_processing")
+
+        logger.info(f"Routage du batch → {paths}")
+        return paths
 
     @task(task_id="enrich_events")
     def enrich_events(validated: dict, **context) -> list:
@@ -368,10 +413,108 @@ with DAG(
         logger.info(f"✅ PostgreSQL — insérés: {inserted}, skippés: {skipped}")
         return {"inserted": inserted, "skipped": skipped}
 
-    # ── Orchestration ─────────────────────────────────────────
-    raw      = consume_from_redis()
-    validated = validate_events(raw)
-    enriched  = enrich_events(validated)
+    @task(task_id="store_p2p_to_parquet")
+    def store_p2p_to_parquet(validated: dict, **context) -> str:
+        """
+        Branche P2P : sauvegarde les événements réseau p2p_network_events
+        en Parquet sur MinIO, partitionnés par heure.
+        Ces events ne vont pas dans la table listening_events ; ils sont
+        conservés bruts pour l'analyse réseau / détection de fraude.
+        """
+        import logging
+        import boto3
+        import pandas as pd
+        import pyarrow as pa
+        import pyarrow.parquet as pq
+        import io
 
-    store_to_parquet(enriched)
-    upsert_to_postgres(enriched)
+        logger = logging.getLogger(__name__)
+
+        events = validated.get("valid_p2p", [])
+        if not events:
+            logger.info("Aucun événement P2P à sauvegarder")
+            return ""
+
+        df = pd.DataFrame(events)
+
+        now    = datetime.utcnow()
+        date   = now.strftime("%Y-%m-%d")
+        hour   = now.strftime("%H")
+        run_id = context["run_id"].replace(":", "-").replace("+", "-")
+
+        path = f"p2p_network_events/date={date}/hour={hour}/part-{run_id}.parquet"
+
+        table  = pa.Table.from_pandas(df)
+        buffer = io.BytesIO()
+        pq.write_table(table, buffer)
+        buffer.seek(0)
+
+        s3 = boto3.client(
+            "s3",
+            endpoint_url="http://minio:9000",
+            aws_access_key_id="minioadmin",
+            aws_secret_access_key="minioadmin",
+            region_name="us-east-1",
+        )
+        s3.put_object(
+            Bucket="spotify-parquet",
+            Key=path,
+            Body=buffer.getvalue(),
+        )
+
+        logger.info(f"✅ Parquet P2P sauvegardé : s3://spotify-parquet/{path} ({len(events)} events)")
+        return path
+
+    @task(
+        task_id="summarize",
+        trigger_rule=TriggerRule.NONE_FAILED_MIN_ONE_SUCCESS,
+    )
+    def summarize(
+        parquet_path: str = "",
+        upsert_result: dict = None,
+        p2p_path: str = "",
+        **context,
+    ) -> dict:
+        """
+        Jointure finale des branches. S'exécute quel que soit le chemin
+        emprunté grâce à trigger_rule=NONE_FAILED_MIN_ONE_SUCCESS
+        (les branches non choisies sont skipped, pas en échec).
+        """
+        import logging
+
+        logger = logging.getLogger(__name__)
+
+        upsert_result = upsert_result or {}
+        summary = {
+            "listening_parquet": parquet_path or None,
+            "p2p_parquet":       p2p_path or None,
+            "inserted":          upsert_result.get("inserted", 0),
+            "skipped":           upsert_result.get("skipped", 0),
+        }
+        logger.info(f"📊 Résumé du run : {summary}")
+        return summary
+
+    # ── Orchestration ─────────────────────────────────────────
+    raw       = consume_from_redis()
+    validated = validate_events(raw)
+
+    # Branche conditionnelle
+    choice = route_events(validated)
+
+    # Chemin "skip" si batch vide
+    skip = EmptyOperator(task_id="skip_processing")
+
+    # Chemin listening
+    enriched       = enrich_events(validated)
+    parquet_path   = store_to_parquet(enriched)
+    upsert_result  = upsert_to_postgres(enriched)
+
+    # Chemin p2p
+    p2p_path = store_p2p_to_parquet(validated)
+
+    # Le branch contrôle les têtes de chaque chemin
+    choice >> [enriched, p2p_path, skip]
+
+    # Jointure finale
+    final = summarize(parquet_path, upsert_result, p2p_path)
+    [parquet_path, upsert_result, p2p_path, skip] >> final
