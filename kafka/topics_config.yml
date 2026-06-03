@@ -1,1 +1,50 @@
+# Configuration des topics Kafka (Phase 3)
+topics:
+  # Événements temps réel générés par le simulateur
+  listening_events:
+    partitions: 6
+    replication_factor: 3
+    retention_ms: 604800000 # 7 jours
+  
+  # Réseau P2P généré par le simulateur
+  p2p_network_events:
+    partitions: 6
+    replication_factor: 3
 
+  # Mises à jour du catalogue (compacté)
+  catalog_updates:
+    partitions: 3
+    replication_factor: 3
+    cleanup_policy: compact
+
+  # Flux enrichi (Spark: stream x static)
+  enriched_events:
+    partitions: 6
+    replication_factor: 3
+
+  # Alertes de fraudes (Spark)
+  fraud_alerts:
+    partitions: 3
+    replication_factor: 3
+    
+  # Événements tardifs détectés par watermark (Spark)
+  late_listening_events:
+    partitions: 3
+    replication_factor: 3
+
+  # Requêtes de recherche cross-groupes
+  p2p_cross_requests:
+    partitions: 3
+    replication_factor: 3
+    
+  # Catalogue fédéré de tous les groupes
+  catalog_federation:
+    partitions: 3
+    replication_factor: 3
+    cleanup_policy: compact
+    
+  # Métriques d'écoutes partagées
+  global_metrics:
+    partitions: 3
+    replication_factor: 3
+    cleanup_policy: compact

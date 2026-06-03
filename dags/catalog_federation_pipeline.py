@@ -116,8 +116,9 @@ with DAG(
             with open(CONTRACT_PATH, "r", encoding="utf-8") as f:
                 schema = json.load(f)
         except Exception as err:
-            # Fallback si le chemin dans le conteneur est différent
-            alt_path = "/Users/ghilesmekdam/Projets/Data_Pipeline/contracts/catalog_federation_schema.json"
+            # Fallback : chercher le contrat relativement au dossier du DAG
+            dag_dir = os.path.dirname(os.path.abspath(__file__))
+            alt_path = os.path.join(dag_dir, "..", "contracts", "catalog_federation_schema.json")
             if os.path.exists(alt_path):
                 with open(alt_path, "r", encoding="utf-8") as f:
                     schema = json.load(f)
