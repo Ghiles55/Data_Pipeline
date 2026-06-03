@@ -1,0 +1,34 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "CatalogFederationSchema",
+  "type": "object",
+  "properties": {
+    "track_id": {
+      "type": "string",
+      "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
+    },
+    "source_group": {
+      "type": "string",
+      "minLength": 1
+    },
+    "artist_name": {
+      "type": "string",
+      "minLength": 1
+    },
+    "track_title": {
+      "type": "string",
+      "minLength": 1
+    },
+    "duration_ms": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "genre": {
+      "type": "string"
+    },
+    "audio_peer_endpoint": {
+      "type": "string"
+    }
+  },
+  "required": ["track_id", "source_group", "artist_name", "track_title", "duration_ms"]
+}

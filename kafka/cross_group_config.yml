@@ -1,0 +1,5 @@
+groups:
+  groupe-b:
+    bootstrap_servers: "localhost:29094"
+  groupe-c:
+    bootstrap_servers: "localhost:29096"

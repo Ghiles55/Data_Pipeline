@@ -133,6 +133,12 @@ class P2PSimulator:
             f"rate={events_per_second} evt/s | kafka={'on' if self.producer else 'off'}"
         )
 
+        # Thread de gestion des requêtes cross-groupes (Phase 3)
+        if self.producer:
+            import threading
+            self.cross_group_thread = threading.Thread(target=self._cross_group_handler_loop, daemon=True)
+            self.cross_group_thread.start()
+
     def _init_kafka(self, enable_kafka: bool):
         """
         Initialise le producteur Kafka.
@@ -156,10 +162,12 @@ class P2PSimulator:
                 "acks":               "all",          # toutes les répliques in-sync
                 "enable.idempotence": True,           # pas de doublons sur retry
                 "client.id":          "p2p_simulator",
+                "transactional.id":   "p2p-simulator-1",
                 "linger.ms":          50,             # petit batch pour le débit
                 "compression.type":   "snappy",
             })
-            logger.info(f"Producteur Kafka initialisé | bootstrap={KAFKA_BOOTSTRAP}")
+            producer.init_transactions()
+            logger.info(f"Producteur Kafka initialisé (Exactly-Once Transactions) | bootstrap={KAFKA_BOOTSTRAP}")
             return producer
         except Exception as e:
             logger.warning(f"Init Kafka impossible ({e}) — publication Redis uniquement")
@@ -171,13 +179,16 @@ class P2PSimulator:
 
         while self.running:
             try:
-                # 80% écoutes, 20% événements réseau P2P
-                if random.random() < 0.8:
+                # 70% écoutes, 20% réseau P2P, 10% requêtes cross-groupes
+                r = random.random()
+                if r < 0.7:
                     event = self._generate_listening_event()
                     self._publish_event("listening", event)
-                else:
+                elif r < 0.9:
                     event = self._generate_p2p_network_event()
                     self._publish_event("p2p_network", event)
+                else:
+                    self._generate_and_publish_cross_request()
 
                 self.event_count += 1
 
@@ -188,7 +199,68 @@ class P2PSimulator:
 
             except Exception as e:
                 logger.error(f"Erreur lors de la génération d'événement : {e}")
-                time.sleep(1)
+
+    def _generate_and_publish_cross_request(self):
+        if self.producer is None:
+            return
+        
+        # 50% sortant vers groupe-b/c, 50% entrant vers groupe-a (nous) pour simulation locale
+        if random.random() < 0.5:
+            target = random.choice(["groupe-b", "groupe-c"])
+            req_group = "groupe-a"
+        else:
+            target = "groupe-a"
+            req_group = random.choice(["groupe-b", "groupe-c"])
+            
+        track = random.choice(SAMPLE_TRACKS)
+        req = {
+            "request_id":       str(uuid.uuid4()),
+            "requesting_group": req_group,
+            "target_group":     target,
+            "track_id":         track["id"],
+            "peer_id":          random.choice(self.active_peers),
+            "timestamp":        datetime.utcnow().isoformat() + "Z"
+        }
+        payload = json.dumps(req)
+        try:
+            self.producer.begin_transaction()
+            self.producer.produce("p2p_cross_requests", key=req["request_id"], value=payload.encode("utf-8"))
+            self.producer.poll(0)
+            self.producer.commit_transaction()
+            if target != "groupe-a":
+                logger.info(f"Requête cross-group publiée vers {target} pour le track {track['id']}")
+        except Exception as e:
+            try:
+                self.producer.abort_transaction()
+            except:
+                pass
+
+    def _cross_group_handler_loop(self):
+        from confluent_kafka import Consumer, KafkaError
+        consumer = Consumer({
+            "bootstrap.servers":  KAFKA_BOOTSTRAP,
+            "group.id":           "p2p_simulator_cross_group_consumer",
+            "auto.offset.reset":  "latest"
+        })
+        consumer.subscribe(["p2p_cross_requests"])
+        
+        while self.running:
+            msg = consumer.poll(1.0)
+            if msg is None:
+                continue
+            if msg.error():
+                continue
+            try:
+                data = json.loads(msg.value().decode("utf-8"))
+                target = data.get("target_group")
+                if target == "groupe-a":
+                    req_group = data.get("requesting_group", "unknown")
+                    track_id = data.get("track_id", "unknown")
+                    latency = random.randint(50, 450)
+                    print(f"[CROSS-GROUP] groupe-a → {req_group} : track_id={track_id} latency={latency}ms OK", flush=True)
+            except Exception as e:
+                pass
+        consumer.close()
 
     # ── Génération d'événements ──────────────────────────────
 
@@ -247,6 +319,8 @@ class P2PSimulator:
             event["track_id"]      = random.choice(SAMPLE_TRACKS)["id"]
             event["chunk_size_kb"] = random.randint(64, 512)
             event["target_peer"]   = random.choice(self.active_peers)
+            failure_prob = 0.6 if self.mode == "fraud" else 0.05
+            event["status"] = "failed" if random.random() < failure_prob else "success"
 
         elif event_type in ("cache_hit", "cache_miss"):
             event["track_id"]    = random.choice(SAMPLE_TRACKS)["id"]
@@ -293,6 +367,7 @@ class P2PSimulator:
         if self.producer is None:
             return
         try:
+            self.producer.begin_transaction()
             # Clé = event_id → répartition régulière sur les 6 partitions
             self.producer.produce(
                 topic=topic,
@@ -302,17 +377,31 @@ class P2PSimulator:
             )
             # Sert les callbacks de livraison sans bloquer la boucle
             self.producer.poll(0)
+            self.producer.commit_transaction()
         except BufferError:
             # File du producteur pleine : on draine puis on réessaie une fois
             self.producer.poll(0.5)
-            self.producer.produce(
-                topic=topic,
-                key=event["event_id"],
-                value=payload.encode("utf-8"),
-                on_delivery=self._on_delivery,
-            )
+            try:
+                self.producer.begin_transaction()
+                self.producer.produce(
+                    topic=topic,
+                    key=event["event_id"],
+                    value=payload.encode("utf-8"),
+                    on_delivery=self._on_delivery,
+                )
+                self.producer.commit_transaction()
+            except Exception as ex:
+                logger.error(f"Erreur Kafka retry transaction — topic={topic} : {ex}")
+                try:
+                    self.producer.abort_transaction()
+                except:
+                    pass
         except Exception as e:
-            logger.error(f"Erreur Kafka — topic={topic} : {e}")
+            logger.error(f"Erreur Kafka transaction — topic={topic} : {e}")
+            try:
+                self.producer.abort_transaction()
+            except:
+                pass
 
     @staticmethod
     def _on_delivery(err, msg):

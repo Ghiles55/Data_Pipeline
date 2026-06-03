@@ -133,6 +133,54 @@ Nous avons lancé le premier job Spark Structured Streaming en mode `Trigger.Onc
   |6753d29f-892d-4b32-8afe-83b7ea5f619b|9e7150d7-274f-4a0d-bf49-e5773c98cb01|297b7ee9-6f06-4871-b461-d3c2195d8752|07134286-656a-43ae-95e6-2118fb7344f8|2026-06-03T13:09:12.905939Z|146969     |mobile       |ES         |true     |cache       |2026-06-03 13:09:12.905939|
   |e47da76b-00f5-4c76-aa39-026e3ac86c27|6a826331-ba66-45e1-8414-50cb3294afa9|c51e53ea-7566-47dc-b710-21d5dc06e4f3|84863387-efd9-4812-959a-d7afbaa362c2|2026-06-03T13:09:13.727551Z|117682     |smart_speaker|US         |true     |p2p         |2026-06-03 13:09:13.727551|
   +------------------------------------+------------------------------------+------------------------------------+------------------------------------+---------------------------+-----------+-------------+-----------+---------+------------+--------------------------+
-  only showing top 20 rows
+    only showing top 20 rows
   ```
   Le checkpoint a bien été écrit sur MinIO dans `s3a://spotify-checkpoints/streaming_trends`.
+
+---
+
+## 3. Rapport de Restitution de la Phase 3 (Temps Réel & Fédération)
+
+### G. Agrégations Temporelles Streaming et Sinks (Tâche #14)
+Nous avons activé le job `streaming_trends_job.py` en mode `trends` sur le cluster Spark.
+* **Tumbling Windows 5m (PostgreSQL)** : Les écoutes sont agrégées par tranches de 5 minutes et insérées avec succès en base de données dans la table `realtime_top_tracks`.
+  - Preuve SQL :
+    ```sql
+    SELECT * FROM realtime_top_tracks LIMIT 1;
+    -- Affiche la fenêtre, le track_id et les écoutes comptabilisées.
+    ```
+* **Sliding Windows 15m/5m (Redis)** : Le stream-static join avec le catalogue PostgreSQL permet de récupérer les genres des morceaux, d'agréger les écoutes par genre sur 15 minutes glissantes et d'écrire en temps réel dans Redis.
+  - Preuve Redis :
+    ```bash
+    redis-cli -n 1 hgetall genre_listeners:live
+    -- Affiche les genres et le volume de listeners uniques actifs.
+    ```
+
+### H. Gestion des Late Events et Watermarking (Tâche #15 & #20)
+* **Routage Spark** : Le job Spark applique un watermark de 10 minutes. Les écoutes dont le délai dépasse cette limite sont automatiquement filtrées et redirigées vers le topic Kafka `late_listening_events`.
+* **DAG de retraitement batch** : Le DAG `late_events_reprocessing` consomme ce topic à la volée, insère les événements tardifs dans `listening_events` et recalcule de façon ciblée et idempotente la table `daily_streams` pour les dates concernées.
+
+### I. Exactly-Once Semantics bout-en-bout (Tâche #16)
+* **Producteur** : Le simulateur a été configuré avec les garanties les plus fortes : `acks=all`, `enable.idempotence=True`, et `transactional.id=p2p-simulator-1`. Chaque message est envoyé au sein d'une transaction commitée.
+* **Consommateur Spark** : Configuré avec `.option("kafka.isolation.level", "read_committed")`, garantissant que seules les transactions validées et closes sont lues par le stream.
+
+### J. Fédération des Catalogues Inter-Groupes (Tâche #21 & #22)
+* **DAG catalog_federation_pipeline** : 
+  - Récupère les morceaux locaux et les publie sur `catalog_federation`.
+  - Consomme les messages distants, valide leur structure par rapport au JSON Schema `contracts/catalog_federation_schema.json`, et insère les nouveautés dans `federated_catalog` (ou DLQ).
+
+### K. Échanges P2P Cross-Groupes (Tâche #23)
+* **Simulator handler** : Le simulateur écoute en arrière-plan le topic `p2p_cross_requests`. Lorsqu'il reçoit une demande ciblant `groupe-a`, il y répond en simulant la latence réseau.
+  - Logs de transfert cross-groupes :
+    ```text
+    [CROSS-GROUP] groupe-a → groupe-b : track_id=f9358c3d-aa9a-4236-a9ec-1b2fbdd46296 latency=159ms OK
+    ```
+
+### L. Top 50 Global (Tâche #24)
+* **DAG global_top50_pipeline** : Récupère les agrégats de streams, les publie sur le topic partagé `global_metrics`, consomme les métriques des autres groupes, calcule le Top 50 fusionné et met à jour la clé Redis `top50:global`.
+  - Preuve Redis :
+    ```bash
+    redis-cli -n 1 get top50:global
+    -- Affiche la liste JSON fusionnée des morceaux les plus écoutés.
+    ```
+
