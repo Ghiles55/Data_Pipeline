@@ -8,21 +8,22 @@ Outputs :
     - PostgreSQL → table `realtime_top_tracks` (top 10 par fenêtre de 5 min)
     - Redis      → clé `top_tracks:live` (top genres par sliding window)
 
-Lancement :
+Lancement (job test #13 — affichage console) :
     spark-submit \\
         --packages org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.0,\\
-                   org.postgresql:postgresql:42.7.1 \\
-        spark_jobs/streaming_trends_job.py
+                   org.postgresql:postgresql:42.7.1,\\
+                   org.apache.hadoop:hadoop-aws:3.3.4,\\
+                   com.amazonaws:aws-java-sdk-bundle:1.12.262 \\
+        /opt/spark-jobs/streaming_trends_job.py --mode console --trigger processing
 
-TODO :
-    [ ] Implémenter la lecture du topic Kafka avec readStream
-    [ ] Désérialiser les messages JSON avec le bon schéma
-    [ ] Implémenter les fenêtres tumbling de 5 minutes
-    [ ] Implémenter les sliding windows pour les genres (15 min / 5 min)
-    [ ] Configurer le checkpoint sur MinIO
-    [ ] Écrire les résultats dans PostgreSQL et Redis
+État :
+    [x] read_kafka_stream() : lecture du topic Kafka + JSON + event_time  (#13)
+    [x] Sink console append + checkpoint MinIO + triggers processingTime/Once  (#13)
+    [ ] Fenêtres tumbling 5 min → realtime_top_tracks (PostgreSQL)  (issue suivante)
+    [ ] Sliding windows genres (15 min / 5 min) → Redis  (issue suivante)
 """
 
+import argparse
 import os
 from pyspark.sql import SparkSession
 from pyspark.sql import functions as F
@@ -96,20 +97,74 @@ def create_spark_session() -> SparkSession:
 
 def read_kafka_stream(spark: SparkSession):
     """
-    Lit le topic Kafka `listening_events` en streaming.
+    Lit le topic Kafka `listening_events` en streaming et renvoie un
+    DataFrame typé (une ligne = un événement d'écoute).
 
-    TODO :
-        1. Utiliser spark.readStream.format("kafka")
-        2. Configurer kafka.bootstrap.servers, subscribe, startingOffsets
-        3. Caster la colonne "value" (bytes) en string
-        4. Parser le JSON avec from_json() et LISTENING_EVENT_SCHEMA
-        5. Caster la colonne "timestamp" (string ISO) en TimestampType
-        6. Renommer en "event_time" pour les fenêtres temporelles
+    Étapes :
+        1. readStream.format("kafka") sur les 3 brokers
+        2. value (bytes) → string
+        3. from_json() avec LISTENING_EVENT_SCHEMA
+        4. timestamp ISO ("…Z") → TimestampType (colonne event_time)
+           pour les fenêtres temporelles des jobs suivants.
 
     Returns:
-        DataFrame streaming avec colonnes typées
+        DataFrame streaming avec colonnes typées + event_time
     """
-    raise NotImplementedError("TODO : implémenter read_kafka_stream()")
+    raw = (
+        spark.readStream
+        .format("kafka")
+        .option("kafka.bootstrap.servers", KAFKA_BOOTSTRAP)
+        .option("subscribe", KAFKA_TOPIC)
+        # latest : on ne lit que les nouveaux events (flux temps réel du simulateur)
+        .option("startingOffsets", "latest")
+        # ne pas planter si un offset a expiré (retention.ms)
+        .option("failOnDataLoss", "false")
+        .load()
+    )
+
+    parsed = (
+        raw
+        .selectExpr("CAST(value AS STRING) AS json_str")
+        .select(F.from_json(F.col("json_str"), LISTENING_EVENT_SCHEMA).alias("data"))
+        .select("data.*")
+        # "2026-06-03T10:39:50.436Z" → on retire le "Z" final puis on caste
+        .withColumn(
+            "event_time",
+            F.to_timestamp(F.regexp_replace(F.col("timestamp"), "Z$", "")),
+        )
+    )
+    return parsed
+
+
+# ─────────────────────────────────────────────────────────────
+# SINK CONSOLE — JOB TEST (issue #13)
+# ─────────────────────────────────────────────────────────────
+
+def write_console_stream(events_df, trigger: str = "processing"):
+    """
+    Sink `console` en mode append : affiche le flux d'events pour valider
+    la lecture Kafka (issue #13). Checkpoint sur MinIO comme demandé.
+
+    trigger :
+        "processing" → micro-batch toutes les 10 s (processingTime)
+        "once"       → un seul batch puis arrêt (Trigger.Once)
+    """
+    writer = (
+        events_df.writeStream
+        .outputMode("append")
+        .format("console")
+        .option("truncate", "false")
+        .option("numRows", 20)
+        # Checkpoint MinIO (bucket spotify-checkpoints créé par minio-init)
+        .option("checkpointLocation", CHECKPOINT_PATH + "/console")
+    )
+
+    if trigger == "once":
+        writer = writer.trigger(once=True)
+    else:
+        writer = writer.trigger(processingTime="10 seconds")
+
+    return writer.start()
 
 
 # ─────────────────────────────────────────────────────────────
@@ -154,25 +209,39 @@ def compute_genre_listeners_sliding(events_df, catalog_df):
 # ─────────────────────────────────────────────────────────────
 
 def main():
+    # parse_known_args : ignore les éventuels arguments passés par spark-submit
+    parser = argparse.ArgumentParser(description="SPOTIFY streaming_trends_job")
+    parser.add_argument(
+        "--mode", choices=["console", "trends"], default="console",
+        help="console = job test #13 (affichage) ; trends = agrégations (issues suivantes)",
+    )
+    parser.add_argument(
+        "--trigger", choices=["processing", "once"], default="processing",
+        help="processing = processingTime(10s) ; once = Trigger.Once",
+    )
+    args, _ = parser.parse_known_args()
+
     spark = create_spark_session()
     spark.sparkContext.setLogLevel("WARN")
 
     print("Démarrage streaming_trends_job...")
-    print(f"Kafka : {KAFKA_BOOTSTRAP} → topic : {KAFKA_TOPIC}")
+    print(f"Mode       : {args.mode} | trigger : {args.trigger}")
+    print(f"Kafka      : {KAFKA_BOOTSTRAP} → topic : {KAFKA_TOPIC}")
     print(f"Checkpoint : {CHECKPOINT_PATH}")
 
-    # Lecture Kafka
+    # Lecture Kafka (commune à tous les modes)
     events_df = read_kafka_stream(spark)
 
-    # Chargement du catalogue (jointure statique — Phase 2, seq 2.3)
-    # catalog_df = spark.read.jdbc(POSTGRES_URL, "tracks", properties=POSTGRES_PROPS)
-
-    # Agrégations
-    query_top_tracks = compute_top_tracks_tumbling(events_df)
-    # query_genres     = compute_genre_listeners_sliding(events_df, catalog_df)
-
-    # Attendre l'arrêt gracieux
-    spark.streams.awaitAnyTermination()
+    if args.mode == "console":
+        # ── Issue #13 : valider la lecture du topic en console ──
+        query = write_console_stream(events_df, trigger=args.trigger)
+        query.awaitTermination()
+    else:
+        # ── Agrégations temps réel (issues suivantes, seq 2.3+) ──
+        # catalog_df = spark.read.jdbc(POSTGRES_URL, "tracks", properties=POSTGRES_PROPS)
+        query_top_tracks = compute_top_tracks_tumbling(events_df)
+        # query_genres   = compute_genre_listeners_sliding(events_df, catalog_df)
+        spark.streams.awaitAnyTermination()
 
 
 if __name__ == "__main__":
