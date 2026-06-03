@@ -70,11 +70,11 @@ Répartition **par issue, en rotation** sur les 3 membres. Sur 5 issues la rotat
 
 | # | Issue | Membre |
 |---|-------|--------|
-| #1 | Setup Docker Compose | **MEKDAM Ghiles** |
+| #1 | Setup Docker Compose | **CHABA Ramdane** |
 | #2 | Schéma PostgreSQL & modèle de données | **CHABA Ramdane** |
 | #3 | Data Generator (Faker) | **Aouimeur Ouissem** |
-| #4 | DAG catalog_ingestion_pipeline | **MEKDAM Ghiles** |
-| #5 | Simulateur P2P + Redis pub/sub | **CHABA Ramdane** |
+| #4 | DAG catalog_ingestion_pipeline | **Aouimeur Ouissem** |
+| #5 | Simulateur P2P + Redis pub/sub | **MEKDAM Ghiles** |
 
 **Charge lundi :** Ghiles 2 issues · Ramdane 2 issues · Ouissem 1 issue.
 

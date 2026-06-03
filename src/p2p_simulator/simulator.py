@@ -65,10 +65,26 @@ EVENT_SOURCES = ["p2p", "p2p", "p2p", "direct", "cache"]  # 60% P2P
 # DONNÉES SIMULÉES
 # ─────────────────────────────────────────────────────────────
 
-SAMPLE_TRACKS = [
-    {"id": str(uuid.uuid4()), "title": f"Track {i}", "duration_ms": random.randint(120000, 300000)}
-    for i in range(50)
-]
+SAMPLE_TRACKS = []
+try:
+    import glob
+    for f_path in glob.glob("data/labels/*.json"):
+        with open(f_path, "r", encoding="utf-8") as f:
+            cat = json.load(f)
+            for track in cat.get("tracks", []):
+                SAMPLE_TRACKS.append({
+                    "id": track["id"],
+                    "title": track["title"],
+                    "duration_ms": track["duration_ms"]
+                })
+except Exception:
+    pass
+
+if not SAMPLE_TRACKS:
+    SAMPLE_TRACKS = [
+        {"id": str(uuid.uuid4()), "title": f"Track {i}", "duration_ms": random.randint(120000, 300000)}
+        for i in range(50)
+    ]
 
 SAMPLE_USERS = [str(uuid.uuid4()) for _ in range(200)]
 SAMPLE_PEERS = [str(uuid.uuid4()) for _ in range(20)]

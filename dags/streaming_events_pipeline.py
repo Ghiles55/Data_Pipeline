@@ -254,7 +254,7 @@ with DAG(
         cur.execute("""
             SELECT id, title, artist_id, genre
             FROM tracks
-            WHERE id = ANY(%s)
+            WHERE id = ANY(%s::uuid[])
         """, (track_ids,))
 
         tracks_map = {
