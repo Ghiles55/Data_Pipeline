@@ -78,6 +78,18 @@ def main():
     spark = create_spark_session()
     spark.sparkContext.setLogLevel("WARN")
 
+    # Force loading of PostgreSQL JDBC driver to register it with DriverManager
+    try:
+        spark.read.format("jdbc") \
+            .option("url", POSTGRES_URL) \
+            .option("dbtable", "tracks") \
+            .option("user", POSTGRES_PROPS["user"]) \
+            .option("password", POSTGRES_PROPS["password"]) \
+            .option("driver", POSTGRES_PROPS["driver"]) \
+            .load().limit(0).count()
+    except Exception as e:
+        print(f"Warning loading JDBC driver: {e}")
+
     print("Démarrage de la détection de fraudes streaming…")
 
     # 1. Lecture des topics Kafka
@@ -132,7 +144,7 @@ def main():
             F.col("user_id"),
             F.lit(None).cast("string").alias("peer_id"),
             F.lit("burst_listen").alias("fraud_type"),
-            F.min(F.lit(1.0), F.col("listen_count") / F.lit(50.0)).alias("suspicion_score"),
+            F.least(F.lit(1.0), F.col("listen_count") / F.lit(50.0)).alias("suspicion_score"),
             F.to_json(F.struct("listen_count")).alias("evidence"),
             F.col("window.start").alias("window_start"),
             F.col("window.end").alias("window_end")
@@ -269,6 +281,7 @@ def main():
         alerts_df
         .selectExpr("CAST(COALESCE(user_id, peer_id) AS STRING) AS key", "to_json(struct(*)) AS value")
         .writeStream
+        .outputMode("update")
         .format("kafka")
         .option("kafka.bootstrap.servers", KAFKA_BOOTSTRAP)
         .option("topic", "fraud_alerts")

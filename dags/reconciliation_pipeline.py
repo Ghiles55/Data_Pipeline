@@ -116,14 +116,16 @@ with DAG(
             alerts = []
             
             for row in rows:
-                track_id, batch_count, streaming_count = row
+                track_id, b_cnt, s_cnt = row
+                batch_count = float(b_cnt) if b_cnt is not None else 0.0
+                streaming_count = float(s_cnt) if s_cnt is not None else 0.0
                 
                 # Calcul de la divergence
                 max_val = max(batch_count, streaming_count)
-                if max_val == 0:
+                if max_val == 0.0:
                     divergence = 0.0
                 else:
-                    divergence = abs(batch_count - streaming_count) / float(max_val)
+                    divergence = abs(batch_count - streaming_count) / max_val
                 
                 alert_triggered = divergence > 0.05
                 

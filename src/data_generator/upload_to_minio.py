@@ -44,11 +44,11 @@ def main() -> int:
 
     for f in files:
         s3.upload_file(str(f), BUCKET, f.name)
-        print(f"Uploadé : {f.name} → s3://{BUCKET}/{f.name}")
+        print(f"Upload: {f.name} -> s3://{BUCKET}/{f.name}")
 
-    # Vérification
+    # Verification
     objs = s3.list_objects_v2(Bucket=BUCKET).get("Contents", [])
-    print(f"\n{len(objs)} objets dans '{BUCKET}': {[o['Key'] for o in objs]}")
+    print(f"\n{len(objs)} objects in '{BUCKET}': {[o['Key'] for o in objs]}")
     return 0
 
 
