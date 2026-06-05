@@ -36,12 +36,16 @@ graph TD
 
 ### ETL vs ELT — Mapping par pipeline
 
+Rappel : **ETL** = transformer *avant* de charger dans la destination (la donnée arrive déjà propre). **ELT** = charger d'abord la donnée brute dans la destination, puis transformer *à l'intérieur* de celle-ci (souvent en SQL). Choix par pipeline ci-dessous, justifié à partir du code des DAGs (`dags/*.py`) et du job Spark.
+
 | Pipeline | Approche | Justification |
 |----------|----------|---------------|
-| catalog_ingestion | ETL | ... |
-| streaming_events | ... | ... |
-| aggregation | ... | ... |
-| streaming_trends (Spark) | ... | ... |
+| `catalog_ingestion` | **ETL** | Flux du DAG : `extract_from_minio → validate_schema → transform_catalog (normalisation, dédoublonnage) → load_to_postgres (upsert ON CONFLICT)`. La normalisation et la déduplication des artistes se font **en mémoire, avant** l'écriture. Le catalogue de référence (`artists`/`albums`/`tracks`) ne doit contenir ni doublon ni nom incohérent : la donnée doit être propre au moment où elle entre. Transformer avant le chargement (ETL) est le bon choix. |
+| `streaming_events` | **ETL** (hybride léger) | Flux : `consume_from_redis → validate_events (invalides → DLQ) → enrich_events (jointure catalogue) → store_to_parquet (MinIO) + upsert_to_postgres`. Validation et enrichissement (track_id → artiste/genre) se font **dans le worker avant** l'écriture, et les événements défectueux partent en DLQ avant de polluer la table. ETL en micro-batch (5 min). Nuance : l'écriture Parquet brute sur MinIO sert aussi de **landing zone** réutilisable, ce qui ouvre la porte à de l'ELT en aval. |
+| `aggregation` | **ELT** | Les données sont déjà chargées dans PostgreSQL (`listening_events`) par le pipeline précédent. `aggregation` recalcule les agrégats **directement en SQL dans la base** (`compute_top_tracks`, `compute_artist_stats`, `compute_p2p_metrics` → `daily_streams`, `artist_stats`). Transformation *après* chargement et *dans* la destination = schéma ELT typique. On exploite la puissance d'agrégation de PostgreSQL (GROUP BY, index horaire) sans réextraire la donnée. |
+| `streaming_trends` (Spark) | **ETL** (streaming) | Spark Structured Streaming lit le flux, calcule les comptes par fenêtre de 5 min (agrégation **dans le moteur Spark**) puis écrit le résultat déjà transformé dans `realtime_top_tracks`. La transformation précède le chargement → ETL appliqué en continu. En couche speed, l'agrégat fenêtré doit être produit *avant* de servir la table temps réel : on ne peut pas attendre un recalcul SQL a posteriori. |
+
+**Lecture transversale :** le socle batch mélange volontairement les deux styles. **ETL en entrée** (catalogue et événements, où la qualité avant écriture est critique et où la DLQ filtre le bruit) et **ELT pour les agrégats** (donnée propre déjà dans PostgreSQL, SQL = l'outil le plus efficace pour agréger). La couche speed (Spark) reste en ETL streaming car la transformation fenêtrée est indissociable de la production du résultat.
 
 ### Partitionnement Parquet
 

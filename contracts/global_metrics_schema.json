@@ -1,0 +1,32 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "GlobalMetricsSchema",
+  "type": "object",
+  "properties": {
+    "group_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "timestamp": {
+      "type": "string"
+    },
+    "top_tracks": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "track_id": {
+            "type": "string",
+            "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
+          },
+          "stream_count": {
+            "type": "integer",
+            "minimum": 0
+          }
+        },
+        "required": ["track_id", "stream_count"]
+      }
+    }
+  },
+  "required": ["group_id", "timestamp", "top_tracks"]
+}

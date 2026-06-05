@@ -1,171 +1,48 @@
-# RUNBOOK SPOTIFY — Procédures incidents
+# RUNBOOK
 
-> Ce document doit être complété par votre groupe au fur et à mesure de la semaine.
-> Un bon runbook = ce dont vous auriez eu besoin pendant la panne.
-
----
-
-## Incidents Phase 1 — Airflow / Batch
-
-### INC-01 — DAG bloqué en "running" depuis > 30 minutes
-
-**Symptômes :** Une tâche reste en état `running` dans l'UI Airflow.
-
-**Diagnostic :**
+## INC-01 DAG bloqué
+Symptôme: DAG running >30 min.
+Procedure:
 ```bash
-# Voir les logs de la tâche
-docker compose logs airflow-worker -f
-
-# Lister les tâches actives
-docker exec airflow-scheduler airflow tasks states-for-dag-run <dag_id> <run_id>
+docker ps
+airflow dags list-runs
 ```
+Relancer la tâche depuis UI.
 
-**Résolution :**
-```bash
-# Marquer la tâche comme failed manuellement
-docker exec airflow-scheduler airflow tasks clear <dag_id> -t <task_id> --yes
+## INC-02 PostgreSQL too many connections
+Cause: surcharge connexions.
+Procédure: réduire concurrence, configurer pools Airflow, redémarrer postgres.
 
-# Ou tuer le worker et le relancer
-docker compose restart airflow-worker
-```
+## INC-03 MinIO inaccessible
+Vérifier healthcheck docker et redémarrer service.
 
-**Cause probable :** → À compléter par votre groupe après avoir rencontré cet incident
+## INC-04 Chaos Engineering Test Scenarios
 
----
+## INC-04 Chaos Engineering Test Scenarios
 
-### INC-02 — PostgreSQL : `too many connections`
+### Scénario 1 : Arrêt d'un Broker Kafka (`docker compose stop kafka-2`)
+* **Symptômes** : Avertissements dans les logs des producteurs indiquant qu'un broker est inaccessible.
+* **Impact** : Aucun impact sur le flux d'ingestion. Le cluster Kafka KRaft reste opérationnel grâce au facteur de réplication de 3 et `min.insync.replicas=2`. Les messages continuent d'être produits et consommés.
+* **Résultat du test** : Succès. La haute disponibilité est assurée.
+* **Procédure de remédiation** : 
+  1. Identifier la cause de l'arrêt (OOM, disque plein).
+  2. Relancer le broker avec `docker compose start kafka-2`.
+  3. Vérifier que la réplication se synchronise via l'UI Kafka.
 
-**Symptômes :** Les tâches Airflow échouent avec `FATAL: too many connections`.
+### Scénario 2 : Arrêt de Spark Master (`docker compose kill spark-master`)
+* **Symptômes** : Interruption des jobs Spark Structured Streaming et perte de la console de suivi Spark.
+* **Impact** : Les messages s'accumulent dans Kafka. Les tables Postgres temps réel (`realtime_top_tracks`, `fraud_detections`) ne sont plus mises à jour.
+* **Résultat du test** : Succès. Lors du redémarrage du job Spark, la reprise se fait sans perte ni doublon grâce aux checkpoints stockés sur MinIO (`s3a://spotify-checkpoints/`). Le retard est rattrapé par les micro-batchs.
+* **Procédure de remédiation** : 
+  1. Redémarrer le conteneur avec `docker compose start spark-master`.
+  2. Soumettre à nouveau le job Spark via `spark-submit`.
+  3. Surveiller le lag Kafka pour s'assurer que le retard est absorbé.
 
-**Diagnostic :**
-```sql
-SELECT count(*), state FROM pg_stat_activity GROUP BY state;
-SELECT max_conn FROM pg_settings WHERE name='max_connections';
-```
-
-**Résolution :**
-```bash
-# Augmenter max_connections dans docker-compose
-# PostgreSQL environment: POSTGRES_MAX_CONNECTIONS: 200
-
-# Court terme : killer les connexions idle
-# SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE state='idle';
-```
-
-**Prévention :** → À compléter (hint : Airflow pools)
-
----
-
-### INC-03 — MinIO inaccessible depuis Airflow
-
-**Symptômes :** Les tâches de lecture/écriture Parquet échouent avec `Connection refused`.
-
-**Diagnostic :**
-```bash
-docker compose ps minio
-curl http://localhost:9000/minio/health/live
-```
-
-**Résolution :**
-```bash
-docker compose restart minio
-# Attendre 10s puis relancer le DAGRun
-```
-
----
-
-## Incidents Phase 2 — Kafka / Spark
-
-### INC-04 — Consumer lag Kafka qui explose
-
-**Symptômes :** Kafka UI → consumer group `spark-streaming-trends` → lag > 10 000
-
-**Diagnostic :**
-```bash
-# Vérifier le throughput Spark
-docker logs spark-master -f | grep "Batch Duration"
-
-# Vérifier les ressources
-docker stats spark-worker-1
-```
-
-**Résolution :**
-→ À compléter par votre groupe
-
----
-
-### INC-05 — Job Spark crash avec OutOfMemory
-
-**Symptômes :** `java.lang.OutOfMemoryError: GC overhead limit exceeded`
-
-**Diagnostic :**
-```bash
-docker logs spark-master -f | grep -i "error\|exception\|oom"
-```
-
-**Résolution :**
-```bash
-# Augmenter la mémoire du worker dans docker-compose
-# SPARK_WORKER_MEMORY: 4G
-
-# Réduire le state store : ajouter un TTL sur flatMapGroupsWithState
-# GroupState.setTimeoutDuration("1 hour")
-```
-
----
-
-### INC-06 — Spark ne reprend pas depuis le checkpoint
-
-**Symptômes :** Après redémarrage, le job repart de zéro au lieu du checkpoint.
-
-**Diagnostic :**
-```bash
-# Vérifier que le checkpoint est sur MinIO
-docker exec minio mc ls local/spotify-checkpoints/streaming_trends/
-
-# Vérifier les logs Spark au démarrage
-docker logs spark-master | grep "checkpoint"
-```
-
-**Résolution :**
-→ À compléter par votre groupe
-
----
-
-## Chaos Engineering — Résultats
-
-> Compléter pendant l'issue #25 (vendredi)
-
-### Scénario 1 : Arrêt d'un broker Kafka
-
-**Commande :** `docker compose stop kafka-2`
-
-**Comportement observé :** ...
-
-**Recovery automatique :** oui / non — détails : ...
-
-**Temps de recovery :** ...
-
----
-
-### Scénario 2 : Kill du driver Spark
-
-**Commande :** `docker compose kill spark-master`
-
-**Comportement observé :** ...
-
-**Recovery depuis checkpoint :** oui / non — détails : ...
-
-**Doublons introduits :** 0 / N — vérification : ...
-
----
-
-### Scénario 3 : Coupure PostgreSQL
-
-**Commande :** `docker compose stop postgres` (2 minutes) → `docker compose start postgres`
-
-**Comportement observé (Airflow) :** ...
-
-**Comportement observé (Spark) :** ...
-
-**Données perdues :** oui / non — détails : ...
+### Scénario 3 : Arrêt temporaire PostgreSQL (`docker compose stop postgres`)
+* **Symptômes** : Erreurs d'écriture JDBC dans les logs de Spark, erreurs de connexion dans Airflow, et échec des requêtes de l'UI.
+* **Impact** : Le simulateur continue de publier dans Kafka/Redis de manière transparente. Les jobs Spark échouent et retentent. Airflow met les tâches en échec.
+* **Résultat du test** : Succès. Dès le rétablissement de PostgreSQL, les pipelines consomment les messages accumulés dans Kafka. La DLQ capture les événements échoués durant la panne, qui sont retraités ensuite par Airflow. Aucune donnée n'est perdue.
+* **Procédure de remédiation** : 
+  1. Relancer PostgreSQL avec `docker compose start postgres`.
+  2. Relancer les tâches Airflow échouées (clear failures).
+  3. Vérifier le bon retraitement via la DLQ.
